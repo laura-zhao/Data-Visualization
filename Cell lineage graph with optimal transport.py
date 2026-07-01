@@ -169,14 +169,20 @@ def layered_layout(G, iterations=6):
     return pos
 
 
-def plot_ancestor_graph(G, pos, step_labels, max_linewidth=10):
+def plot_ancestor_graph(G, pos, step_labels, max_linewidth=12):
+    from matplotlib.collections import PolyCollection
+
     pagerank = nx.pagerank(G, weight='weight')
     weights = np.array([d['weight'] for _, _, d in G.edges(data=True)])
-    ranks = pd.Series(weights).rank(pct=True).values  # ecdfQuantile-style scaling
+    ranks = pd.Series(weights).rank(pct=True).values
 
     step_cmap = cm.get_cmap('Set1', len(step_labels))
 
-    fig, ax = plt.subplots(figsize=(12, 12))
+    all_nodes = sorted(G.nodes())
+    node_cmap = cm.get_cmap('tab20', len(all_nodes))
+    node_colors = {node: node_cmap(i) for i, node in enumerate(all_nodes)}
+
+    fig, ax = plt.subplots(figsize=(14, 14))
 
     for (u, v, d), rank in zip(G.edges(data=True), ranks):
         x1, y1 = pos[u]
@@ -186,30 +192,40 @@ def plot_ancestor_graph(G, pos, step_labels, max_linewidth=10):
         if hash((u, v, d['step'])) % 2:
             rad = -rad
 
+        width = rank * max_linewidth + 0.5
+
         arrow = FancyArrowPatch(
             (x1, y1), (x2, y2),
             connectionstyle=f'arc3,rad={rad}',
-            arrowstyle='-|>', mutation_scale=14,
-            linewidth=rank * max_linewidth + 0.3,
+            arrowstyle='-|>', mutation_scale=16,
+            linewidth=width,
             color=step_cmap(d['step']),
-            alpha=0.75, zorder=1,
+            alpha=0.6 + 0.2 * rank,
+            zorder=1,
+            edgecolor='none',
         )
         ax.add_patch(arrow)
 
     for node, (x, y) in pos.items():
-        size = pagerank[node] * 4000 + 60
+        size = pagerank[node] * 5000 + 100
+
+        ax.scatter(x, y, s=size * 1.3, color='white', alpha=0.3, zorder=2, edgecolors='none')
+        ax.scatter(x, y, s=size * 1.15, color=node_colors[node], alpha=0.15, zorder=2, edgecolors='none')
+
         ax.scatter(x, y, s=size, color='black', edgecolors='white',
-                   linewidth=1.2, zorder=3)
-        ax.text(x, y + 0.15, node, fontsize=16, fontweight='bold',
+                   linewidth=2, zorder=3)
+        ax.text(x, y, node, fontsize=14, fontweight='bold',
+                ha='center', va='center', zorder=5, color='white')
+        ax.text(x, y + 0.25, node, fontsize=14, fontweight='bold',
                 ha='center', zorder=4)
 
-    handles = [plt.Line2D([0], [0], color=step_cmap(i), lw=4, label=label)
+    handles = [plt.Line2D([0], [0], color=step_cmap(i), lw=6, label=label)
                for i, label in enumerate(step_labels)]
-    ax.legend(handles=handles, loc='upper left', frameon=False, fontsize=12)
+    ax.legend(handles=handles, loc='upper left', frameon=False, fontsize=12, title='Transitions')
 
-    ax.set_title("Waddington-OT: cell ancestor graph", fontsize=18)
+    ax.set_title("Waddington-OT: cell ancestor graph", fontsize=20, pad=20)
     ax.set_axis_off()
-    ax.margins(0.2)
+    ax.margins(0.25)
     fig.tight_layout()
     return fig
 
