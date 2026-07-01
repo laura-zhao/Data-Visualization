@@ -87,13 +87,49 @@ def build_ancestor_graph(steps, adata, tmap_model, min_weight=MIN_EDGE_WEIGHT):
     return G
 
 
+def acyclic_skeleton(G):
+    """Because nodes are shared cluster labels across time points, the
+    merged graph can contain cycles (e.g. cluster A -> B in one step and
+    B -> A in the next). Classify edges via DFS and drop the ones that
+    point back to a node already on the current DFS stack ("back edges"),
+    the same trick MATLAB's layered layout uses internally to rank nodes
+    in a cyclic digraph. The returned DAG is only used for ranking; the
+    original G (with all edges, including back edges) is still drawn."""
+    simple = nx.DiGraph()
+    simple.add_nodes_from(G.nodes)
+    simple.add_edges_from({(u, v) for u, v in G.edges()})
+
+    acyclic = nx.DiGraph()
+    acyclic.add_nodes_from(simple.nodes)
+    visited, in_stack = set(), set()
+
+    def dfs(n):
+        visited.add(n)
+        in_stack.add(n)
+        for succ in simple.successors(n):
+            if succ not in visited:
+                acyclic.add_edge(n, succ)
+                dfs(succ)
+            elif succ not in in_stack:
+                acyclic.add_edge(n, succ)
+            # else: back edge, drop it to keep the ranking DAG acyclic
+        in_stack.discard(n)
+
+    for n in simple.nodes:
+        if n not in visited:
+            dfs(n)
+
+    return acyclic
+
+
 def longest_path_layers(G):
     """Topological rank of each node by longest path from a source - the
     'dot'-style layer assignment MATLAB's layered layout uses, instead of
     forcing every node into one of a fixed number of time-based rows."""
+    acyclic = acyclic_skeleton(G)
     layer = {}
-    for n in nx.topological_sort(G):
-        preds = list(G.predecessors(n))
+    for n in nx.topological_sort(acyclic):
+        preds = list(acyclic.predecessors(n))
         layer[n] = max((layer[p] for p in preds), default=-1) + 1
     return layer
 
