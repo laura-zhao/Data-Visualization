@@ -1,27 +1,33 @@
 """
-Cell lineage graph with optimal transport (Waddington-OT)
+Cell ancestor graph with optimal transport (Waddington-OT)
 
-Reproduces the "layered digraph" style lineage plots from the Waddington-OT
-papers (e.g. the lung KP tumor evolution figure), using only the transport
-maps already saved to disk by wot.OTModel.compute_all_transport_maps() -
-no OT computation happens in this script.
+Reproduces the MATLAB `plot(digraph(...), 'layout', 'layered')` lineage
+figure from the Waddington-OT papers, using only the transport maps
+already saved to disk by wot.OTModel.compute_all_transport_maps() - no OT
+computation happens in this script.
 
-The MATLAB original builds a digraph of cluster -> cluster edges and calls
-plot(G, 'layout', 'layered'), which is a topological (graphviz "dot" style)
-layout that minimizes edge crossings, then draws each edge as a flowing
-ribbon rather than a plain line. This script reproduces both pieces:
-  - nodes are laid out in horizontal layers, one per time point, with
-    iterative barycenter sweeps (forward + backward, Sugiyama-style) to
-    reduce edge crossings
-  - each edge is drawn as a filled 3D Sankey-style ribbon: a smooth S-curve
-    that tapers to a point at both nodes and bulges to its full width in
-    the middle, while also swaying out into the depth axis and back - that
-    out-and-back sway (combined with a tilted camera) is what produces the
-    woven, cage-like look instead of a flat diagram
-  - edge color is inherited from the earliest (Ta) ancestor, so a lineage
-    keeps one color as it fans out over time
-  - node size is proportional to PageRank centrality on the weighted graph,
-    log-scaled so a few dominant clusters don't dwarf everything else
+Two things the earlier version of this script got wrong, corrected here:
+
+  1. The MATLAB graph is NOT built with one node per (stage, cluster) pair.
+     It strips the stage prefix off each cluster label before building the
+     digraph, so a cluster observed at several time points collapses onto
+     a single shared node, and edges from every consecutive-day transition
+     all land on that same small set of nodes. That's what produces the
+     wide, arcing "cage" look: nodes have many in/out edges from different
+     time steps, and MATLAB's layered layout assigns each node's rank by
+     longest path through the whole graph (not a fixed 3-row grid), so
+     edges that skip several ranks get routed as long curved arcs.
+  2. It is a plain 2D plot with constant-width edges (`p.LineWidth =
+     ecdfQuantile(weight)*10`), not a 3D scene and not tapered Sankey
+     ribbons - both of those were wrong guesses in an earlier revision.
+
+This script matches that: nodes are raw cluster labels shared across time
+points, layer/rank is computed by longest path from source nodes (a
+"dot"-style topological layering) refined with barycenter sweeps, edges
+are constant-width curved arcs, edge color encodes which consecutive-day
+transition the edge came from (matching MATLAB's `zTT` coloring), edge
+width is the percentile rank of the transition weight, and node size is
+PageRank centrality - all mirroring the MATLAB formulas directly.
 """
 
 import wot
@@ -30,16 +36,16 @@ import pandas as pd
 import networkx as nx
 import matplotlib.cm as cm
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from matplotlib.patches import FancyArrowPatch
 
 # Resource paths
 H5AD_PATH = '/home/ZKX/cdh6/hjx.h5ad'
 TMAP_DIR = 'tmaps/bladder'
 
 TIME_MAP = {'Ta': 0.0, 'T1': 1.0, '>T2': 2.0}
-STAGE_ORDER = ['Ta', 'T1', '>T2']
+STEPS = [('Ta', 'T1', 0.0, 1.0), ('T1', '>T2', 1.0, 2.0)]
 CLUSTER_KEY = 'seurat_clusters'
-MIN_EDGE_WEIGHT = 0.01  # drop transitions below this row-normalized probability
+MIN_EDGE_WEIGHT = 0.01  # matches MATLAB's zopts.minFrac = 0.1 style thresholding
 
 
 def load_expression_data():
@@ -63,156 +69,111 @@ def cluster_transition_matrix(tmap_model, adata, day0, day1, cluster_key=CLUSTER
     return agg
 
 
-def build_lineage_graph(matrices, min_weight=MIN_EDGE_WEIGHT):
-    """matrices: list of (stage_from, stage_to, matrix) in chronological
-    order. Returns a networkx.DiGraph with node attr 'stage' and edge
-    attr 'weight'."""
-    G = nx.DiGraph()
+def build_ancestor_graph(steps, adata, tmap_model, min_weight=MIN_EDGE_WEIGHT):
+    """Build one MultiDiGraph over the raw cluster labels (shared across
+    time points, exactly like the MATLAB script stripping the stage
+    prefix off each node name) by stacking every consecutive-day
+    transition matrix onto the same node set."""
+    G = nx.MultiDiGraph()
 
-    for stage, _, matrix in matrices:
-        for cluster in matrix.index:
-            G.add_node(f'{stage}_{cluster}', stage=stage, cluster=str(cluster))
-    last_stage, last_matrix = matrices[-1][1], matrices[-1][2]
-    for cluster in last_matrix.columns:
-        G.add_node(f'{last_stage}_{cluster}', stage=last_stage, cluster=str(cluster))
-
-    for stage_from, stage_to, matrix in matrices:
+    for step_idx, (_, _, day0, day1) in enumerate(steps):
+        matrix = cluster_transition_matrix(tmap_model, adata, day0, day1)
         for src in matrix.index:
             for tgt in matrix.columns:
                 w = matrix.loc[src, tgt]
                 if w > min_weight:
-                    G.add_edge(f'{stage_from}_{src}', f'{stage_to}_{tgt}', weight=w)
+                    G.add_edge(str(src), str(tgt), weight=w, step=step_idx)
 
     return G
 
 
-def lineage_colors(G, root_stage):
-    """Color every node/edge by its earliest (root_stage) ancestor, so a
-    lineage keeps one color as it fans out across later time points."""
-    roots = [n for n, d in G.nodes(data=True) if d['stage'] == root_stage]
-    cmap = cm.get_cmap('tab10', max(len(roots), 1))
-    root_color = {r: cmap(i) for i, r in enumerate(roots)}
-
-    color = dict(root_color)
+def longest_path_layers(G):
+    """Topological rank of each node by longest path from a source - the
+    'dot'-style layer assignment MATLAB's layered layout uses, instead of
+    forcing every node into one of a fixed number of time-based rows."""
+    layer = {}
     for n in nx.topological_sort(G):
-        if n in color:
-            continue
         preds = list(G.predecessors(n))
-        if not preds:
-            color[n] = (0.6, 0.6, 0.6, 1.0)
-            continue
-        # inherit the color of the strongest incoming edge's source
-        best_pred = max(preds, key=lambda p: G[p][n]['weight'])
-        color[n] = color.get(best_pred, (0.6, 0.6, 0.6, 1.0))
-    return color
+        layer[n] = max((layer[p] for p in preds), default=-1) + 1
+    return layer
 
 
-def layered_layout(G, stage_order, iterations=4):
-    """Sugiyama-style layered layout: y = stage index (Ta on top), x =
-    position within the layer. Node order within each layer is refined
-    over several forward (top-down) and backward (bottom-up) barycenter
-    sweeps to reduce edge crossings - a lightweight stand-in for
-    graphviz's 'dot' layout."""
-    layers = {s: [n for n, d in G.nodes(data=True) if d['stage'] == s] for s in stage_order}
-    order = {s: sorted(layers[s], key=str) for s in stage_order}
+def layered_layout(G, iterations=6):
+    """Sugiyama-style layout: rank (y) from longest_path_layers, x within
+    each rank refined by iterative forward/backward barycenter sweeps to
+    reduce edge crossings."""
+    layer = longest_path_layers(G)
+    max_layer = max(layer.values())
+    order = {d: sorted([n for n in G.nodes if layer[n] == d], key=str)
+             for d in range(max_layer + 1)}
 
-    def positions_from_order():
+    def positions():
         pos = {}
-        for depth, stage in enumerate(stage_order):
-            for i, node in enumerate(order[stage]):
-                pos[node] = (float(i), -float(depth))
+        for d, nodes in order.items():
+            for i, n in enumerate(nodes):
+                pos[n] = (float(i) - (len(nodes) - 1) / 2.0, -float(d))
         return pos
 
-    pos = positions_from_order()
-
+    pos = positions()
     for _ in range(iterations):
-        for depth in range(1, len(stage_order)):
-            stage = stage_order[depth]
-
+        for d in range(1, max_layer + 1):
             def bary_fwd(n):
                 xs = [pos[p][0] for p in G.predecessors(n) if p in pos]
                 return np.mean(xs) if xs else pos[n][0]
+            order[d] = sorted(order[d], key=bary_fwd)
+            pos = positions()
 
-            order[stage] = sorted(order[stage], key=bary_fwd)
-            pos = positions_from_order()
-
-        for depth in range(len(stage_order) - 2, -1, -1):
-            stage = stage_order[depth]
-
+        for d in range(max_layer - 1, -1, -1):
             def bary_bwd(n):
                 xs = [pos[s][0] for s in G.successors(n) if s in pos]
                 return np.mean(xs) if xs else pos[n][0]
-
-            order[stage] = sorted(order[stage], key=bary_bwd)
-            pos = positions_from_order()
+            order[d] = sorted(order[d], key=bary_bwd)
+            pos = positions()
 
     return pos
 
 
-def sankey_ribbon_3d(x1, z1, x2, z2, width, bow, n=40):
-    """Vertex strip for one edge in 3D: x eases from x1 to x2 (smoothstep),
-    z (time) descends linearly, and y (depth) bows out to `bow` at the
-    midpoint and back to 0 at both nodes - this out-and-back sway in the
-    depth axis, combined with a tilted camera, is what gives the plot its
-    woven, cage-like look instead of a flat diagram. The ribbon's in-plane
-    width also bulges to `width` at the midpoint and tapers to a point at
-    both endpoints, same as a Sankey flow."""
-    t = np.linspace(0, 1, n)
-    ease = 3 * t ** 2 - 2 * t ** 3
-    x = x1 + (x2 - x1) * ease
-    z = z1 + (z2 - z1) * t
-    y = bow * np.sin(np.pi * t)
-    w = width * np.sin(np.pi * t)
-
-    upper = np.stack([x + w / 2, y, z], axis=1)
-    lower = np.stack([x - w / 2, y, z], axis=1)
-    return upper, lower
-
-
-def plot_lineage_graph_3d(G, pos, node_color, max_ribbon_width=0.7,
-                           elev=18, azim=-70):
+def plot_ancestor_graph(G, pos, step_labels, max_linewidth=10):
     pagerank = nx.pagerank(G, weight='weight')
     weights = np.array([d['weight'] for _, _, d in G.edges(data=True)])
-    ranks = pd.Series(weights).rank(pct=True).values
+    ranks = pd.Series(weights).rank(pct=True).values  # ecdfQuantile-style scaling
 
-    xs_all = [p[0] for p in pos.values()]
-    x_span = max(xs_all) - min(xs_all) or 1.0
+    step_cmap = cm.get_cmap('Set1', len(step_labels))
 
-    fig = plt.figure(figsize=(13, 13))
-    ax = fig.add_subplot(111, projection='3d')
+    fig, ax = plt.subplots(figsize=(12, 12))
 
     for (u, v, d), rank in zip(G.edges(data=True), ranks):
-        x1, z1 = pos[u]
-        x2, z2 = pos[v]
-        # longer transitions sway further into the depth axis; the sign
-        # alternates by source position so lineages weave in front of and
-        # behind one another instead of all bowing the same way
-        side = 1.0 if (hash(u) % 2 == 0) else -1.0
-        bow = side * (0.35 + 0.9 * abs(x2 - x1) / x_span)
-        width = rank * max_ribbon_width + 0.02
+        x1, y1 = pos[u]
+        x2, y2 = pos[v]
+        layer_gap = abs(y2 - y1)
+        rad = 0.15 + 0.06 * layer_gap
+        if hash((u, v, d['step'])) % 2:
+            rad = -rad
 
-        upper, lower = sankey_ribbon_3d(x1, z1, x2, z2, width, bow)
-        color = node_color.get(u, (0.6, 0.6, 0.6, 1.0))
-        quads = [[upper[i], upper[i + 1], lower[i + 1], lower[i]] for i in range(len(upper) - 1)]
-        ax.add_collection3d(Poly3DCollection(quads, facecolor=color, edgecolor='none', alpha=0.55))
+        arrow = FancyArrowPatch(
+            (x1, y1), (x2, y2),
+            connectionstyle=f'arc3,rad={rad}',
+            arrowstyle='-|>', mutation_scale=14,
+            linewidth=rank * max_linewidth + 0.3,
+            color=step_cmap(d['step']),
+            alpha=0.75, zorder=1,
+        )
+        ax.add_patch(arrow)
 
-    for node, (x, z) in pos.items():
-        size = np.log1p(pagerank[node] * 1000) * 300 + 60
-        ax.scatter(x, 0, z, s=size, color='black', edgecolors='white',
-                   linewidth=1.2, depthshade=False, zorder=5)
-        ax.text(x, 0, z + 0.15, G.nodes[node]['cluster'], fontsize=12,
-                fontweight='bold', ha='center', zorder=6)
+    for node, (x, y) in pos.items():
+        size = pagerank[node] * 4000 + 60
+        ax.scatter(x, y, s=size, color='black', edgecolors='white',
+                   linewidth=1.2, zorder=3)
+        ax.text(x, y + 0.15, node, fontsize=16, fontweight='bold',
+                ha='center', zorder=4)
 
-    for stage in set(nx.get_node_attributes(G, 'stage').values()):
-        zs = [pos[n][1] for n, d in G.nodes(data=True) if d['stage'] == stage]
-        if zs:
-            ax.text(min(xs_all) - 1.5, 0, zs[0], stage, fontsize=14,
-                    fontweight='bold', ha='right', va='center')
+    handles = [plt.Line2D([0], [0], color=step_cmap(i), lw=4, label=label)
+               for i, label in enumerate(step_labels)]
+    ax.legend(handles=handles, loc='upper left', frameon=False, fontsize=12)
 
-    ax.set_title("Waddington-OT: cell lineage graph", fontsize=18)
+    ax.set_title("Waddington-OT: cell ancestor graph", fontsize=18)
     ax.set_axis_off()
-    ax.view_init(elev=elev, azim=azim)
-    ax.set_box_aspect((x_span, x_span * 0.6, x_span * 0.7))
+    ax.margins(0.2)
     fig.tight_layout()
     return fig
 
@@ -221,16 +182,9 @@ if __name__ == '__main__':
     adata = load_expression_data()
     tmap_model = wot.tmap.TransportMapModel.from_directory(TMAP_DIR)
 
-    matrix_0_1 = cluster_transition_matrix(tmap_model, adata, 0.0, 1.0)
-    matrix_1_2 = cluster_transition_matrix(tmap_model, adata, 1.0, 2.0)
+    G = build_ancestor_graph(STEPS, adata, tmap_model)
+    pos = layered_layout(G)
+    step_labels = [f'{a} -> {b}' for a, b, _, _ in STEPS]
 
-    G = build_lineage_graph([
-        ('Ta', 'T1', matrix_0_1),
-        ('T1', '>T2', matrix_1_2),
-    ])
-
-    pos = layered_layout(G, STAGE_ORDER)
-    node_color = lineage_colors(G, root_stage='Ta')
-
-    plot_lineage_graph_3d(G, pos, node_color)
+    plot_ancestor_graph(G, pos, step_labels)
     plt.show()
