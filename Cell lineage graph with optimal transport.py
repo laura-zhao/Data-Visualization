@@ -13,9 +13,11 @@ ribbon rather than a plain line. This script reproduces both pieces:
   - nodes are laid out in horizontal layers, one per time point, with
     iterative barycenter sweeps (forward + backward, Sugiyama-style) to
     reduce edge crossings
-  - each edge is drawn as a filled Sankey-style ribbon: a smooth S-curve
-    (the transition tapers in x while y descends linearly) that bulges to
-    its full width in the middle and tapers to a point at both nodes
+  - each edge is drawn as a filled 3D Sankey-style ribbon: a smooth S-curve
+    that tapers to a point at both nodes and bulges to its full width in
+    the middle, while also swaying out into the depth axis and back - that
+    out-and-back sway (combined with a tilted camera) is what produces the
+    woven, cage-like look instead of a flat diagram
   - edge color is inherited from the earliest (Ta) ancestor, so a lineage
     keeps one color as it fans out over time
   - node size is proportional to PageRank centrality on the weighted graph,
@@ -28,6 +30,7 @@ import pandas as pd
 import networkx as nx
 import matplotlib.cm as cm
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 # Resource paths
 H5AD_PATH = '/home/ZKX/cdh6/hjx.h5ad'
@@ -146,51 +149,70 @@ def layered_layout(G, stage_order, iterations=4):
     return pos
 
 
-def sankey_ribbon(x1, y1, x2, y2, width, n=60):
-    """Filled polygon for one edge: a smooth S-curve (x eases from x1 to
-    x2 with a smoothstep while y descends linearly) that bulges to `width`
-    at its midpoint and tapers to a point at both endpoints."""
+def sankey_ribbon_3d(x1, z1, x2, z2, width, bow, n=40):
+    """Vertex strip for one edge in 3D: x eases from x1 to x2 (smoothstep),
+    z (time) descends linearly, and y (depth) bows out to `bow` at the
+    midpoint and back to 0 at both nodes - this out-and-back sway in the
+    depth axis, combined with a tilted camera, is what gives the plot its
+    woven, cage-like look instead of a flat diagram. The ribbon's in-plane
+    width also bulges to `width` at the midpoint and tapers to a point at
+    both endpoints, same as a Sankey flow."""
     t = np.linspace(0, 1, n)
     ease = 3 * t ** 2 - 2 * t ** 3
     x = x1 + (x2 - x1) * ease
-    y = y1 + (y2 - y1) * t
+    z = z1 + (z2 - z1) * t
+    y = bow * np.sin(np.pi * t)
     w = width * np.sin(np.pi * t)
 
-    upper = np.stack([x + w / 2, y], axis=1)
-    lower = np.stack([x - w / 2, y], axis=1)
-    return np.vstack([upper, lower[::-1]])
+    upper = np.stack([x + w / 2, y, z], axis=1)
+    lower = np.stack([x - w / 2, y, z], axis=1)
+    return upper, lower
 
 
-def plot_lineage_graph(G, pos, node_color, max_ribbon_width=0.7):
+def plot_lineage_graph_3d(G, pos, node_color, max_ribbon_width=0.7,
+                           elev=18, azim=-70):
     pagerank = nx.pagerank(G, weight='weight')
     weights = np.array([d['weight'] for _, _, d in G.edges(data=True)])
     ranks = pd.Series(weights).rank(pct=True).values
 
-    fig, ax = plt.subplots(figsize=(12, 12))
+    xs_all = [p[0] for p in pos.values()]
+    x_span = max(xs_all) - min(xs_all) or 1.0
+
+    fig = plt.figure(figsize=(13, 13))
+    ax = fig.add_subplot(111, projection='3d')
 
     for (u, v, d), rank in zip(G.edges(data=True), ranks):
-        x1, y1 = pos[u]
-        x2, y2 = pos[v]
-        poly = sankey_ribbon(x1, y1, x2, y2, width=rank * max_ribbon_width + 0.02)
-        ax.fill(poly[:, 0], poly[:, 1], color=node_color.get(u, (0.6, 0.6, 0.6, 1.0)),
-                alpha=0.55, lw=0, zorder=1)
+        x1, z1 = pos[u]
+        x2, z2 = pos[v]
+        # longer transitions sway further into the depth axis; the sign
+        # alternates by source position so lineages weave in front of and
+        # behind one another instead of all bowing the same way
+        side = 1.0 if (hash(u) % 2 == 0) else -1.0
+        bow = side * (0.35 + 0.9 * abs(x2 - x1) / x_span)
+        width = rank * max_ribbon_width + 0.02
 
-    for node, (x, y) in pos.items():
+        upper, lower = sankey_ribbon_3d(x1, z1, x2, z2, width, bow)
+        color = node_color.get(u, (0.6, 0.6, 0.6, 1.0))
+        quads = [[upper[i], upper[i + 1], lower[i + 1], lower[i]] for i in range(len(upper) - 1)]
+        ax.add_collection3d(Poly3DCollection(quads, facecolor=color, edgecolor='none', alpha=0.55))
+
+    for node, (x, z) in pos.items():
         size = np.log1p(pagerank[node] * 1000) * 300 + 60
-        ax.scatter(x, y, s=size, color='black', edgecolors='white',
-                   linewidth=1.2, zorder=3)
-        ax.text(x, y + 0.15, G.nodes[node]['cluster'], fontsize=13,
-                fontweight='bold', ha='center', zorder=4)
+        ax.scatter(x, 0, z, s=size, color='black', edgecolors='white',
+                   linewidth=1.2, depthshade=False, zorder=5)
+        ax.text(x, 0, z + 0.15, G.nodes[node]['cluster'], fontsize=12,
+                fontweight='bold', ha='center', zorder=6)
 
     for stage in set(nx.get_node_attributes(G, 'stage').values()):
-        ys = [pos[n][1] for n, d in G.nodes(data=True) if d['stage'] == stage]
-        if ys:
-            ax.text(min(x for x, _ in pos.values()) - 1.5, ys[0], stage,
-                    fontsize=14, fontweight='bold', ha='right', va='center')
+        zs = [pos[n][1] for n, d in G.nodes(data=True) if d['stage'] == stage]
+        if zs:
+            ax.text(min(xs_all) - 1.5, 0, zs[0], stage, fontsize=14,
+                    fontweight='bold', ha='right', va='center')
 
     ax.set_title("Waddington-OT: cell lineage graph", fontsize=18)
     ax.set_axis_off()
-    ax.margins(0.15)
+    ax.view_init(elev=elev, azim=azim)
+    ax.set_box_aspect((x_span, x_span * 0.6, x_span * 0.7))
     fig.tight_layout()
     return fig
 
@@ -210,5 +232,5 @@ if __name__ == '__main__':
     pos = layered_layout(G, STAGE_ORDER)
     node_color = lineage_colors(G, root_stage='Ta')
 
-    plot_lineage_graph(G, pos, node_color)
+    plot_lineage_graph_3d(G, pos, node_color)
     plt.show()
