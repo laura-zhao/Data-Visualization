@@ -19,6 +19,7 @@ with networkx:
     matching the MATLAB centrality(G, 'pagerank') sizing
 """
 
+import os
 import wot
 import numpy as np
 import pandas as pd
@@ -166,6 +167,7 @@ def plot_lineage_graph(G, pos, node_color, out_path='pictures/wot_lineage_graph.
     ax.set_axis_off()
     ax.margins(0.15)
     fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     fig.savefig(out_path, dpi=150)
     return fig
 
