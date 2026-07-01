@@ -8,25 +8,26 @@ no OT computation happens in this script.
 
 The MATLAB original builds a digraph of cluster -> cluster edges and calls
 plot(G, 'layout', 'layered'), which is a topological (graphviz "dot" style)
-layout that minimizes edge crossings. This script reproduces the same idea
-with networkx:
-  - nodes are laid out in horizontal layers, one per time point
-  - edge width is scaled by the rank (percentile) of its weight, not the
-    raw weight, so a few huge transitions don't drown out everything else
+layout that minimizes edge crossings, then draws each edge as a flowing
+ribbon rather than a plain line. This script reproduces both pieces:
+  - nodes are laid out in horizontal layers, one per time point, with
+    iterative barycenter sweeps (forward + backward, Sugiyama-style) to
+    reduce edge crossings
+  - each edge is drawn as a filled Sankey-style ribbon: a smooth S-curve
+    (the transition tapers in x while y descends linearly) that bulges to
+    its full width in the middle and tapers to a point at both nodes
   - edge color is inherited from the earliest (Ta) ancestor, so a lineage
     keeps one color as it fans out over time
   - node size is proportional to PageRank centrality on the weighted graph,
-    matching the MATLAB centrality(G, 'pagerank') sizing
+    log-scaled so a few dominant clusters don't dwarf everything else
 """
 
-import os
 import wot
 import numpy as np
 import pandas as pd
 import networkx as nx
 import matplotlib.cm as cm
 import matplotlib.pyplot as plt
-from matplotlib.patches import FancyArrowPatch
 
 # Resource paths
 H5AD_PATH = '/home/ZKX/cdh6/hjx.h5ad'
@@ -65,7 +66,7 @@ def build_lineage_graph(matrices, min_weight=MIN_EDGE_WEIGHT):
     attr 'weight'."""
     G = nx.DiGraph()
 
-    for stage, _, matrix in [(m[0], m[1], m[2]) for m in matrices]:
+    for stage, _, matrix in matrices:
         for cluster in matrix.index:
             G.add_node(f'{stage}_{cluster}', stage=stage, cluster=str(cluster))
     last_stage, last_matrix = matrices[-1][1], matrices[-1][2]
@@ -103,58 +104,82 @@ def lineage_colors(G, root_stage):
     return color
 
 
-def layered_layout(G, stage_order):
-    """Horizontal-layer layout: y = stage index (Ta on top), x = position
-    within the layer chosen with a barycenter heuristic (average x of
-    neighbors in the adjacent, already-placed layer) to reduce edge
-    crossings - a lightweight stand-in for graphviz's 'dot' layout."""
+def layered_layout(G, stage_order, iterations=4):
+    """Sugiyama-style layered layout: y = stage index (Ta on top), x =
+    position within the layer. Node order within each layer is refined
+    over several forward (top-down) and backward (bottom-up) barycenter
+    sweeps to reduce edge crossings - a lightweight stand-in for
+    graphviz's 'dot' layout."""
     layers = {s: [n for n, d in G.nodes(data=True) if d['stage'] == s] for s in stage_order}
+    order = {s: sorted(layers[s], key=str) for s in stage_order}
 
-    pos = {}
-    for i, node in enumerate(sorted(layers[stage_order[0]])):
-        pos[node] = (float(i), 0.0)
+    def positions_from_order():
+        pos = {}
+        for depth, stage in enumerate(stage_order):
+            for i, node in enumerate(order[stage]):
+                pos[node] = (float(i), -float(depth))
+        return pos
 
-    for depth in range(1, len(stage_order)):
-        stage = stage_order[depth]
-        nodes = layers[stage]
+    pos = positions_from_order()
 
-        def barycenter(n):
-            preds = list(G.predecessors(n))
-            xs = [pos[p][0] for p in preds if p in pos]
-            return np.mean(xs) if xs else 0.0
+    for _ in range(iterations):
+        for depth in range(1, len(stage_order)):
+            stage = stage_order[depth]
 
-        ordered = sorted(nodes, key=barycenter)
-        for i, node in enumerate(ordered):
-            pos[node] = (float(i), -float(depth))
+            def bary_fwd(n):
+                xs = [pos[p][0] for p in G.predecessors(n) if p in pos]
+                return np.mean(xs) if xs else pos[n][0]
+
+            order[stage] = sorted(order[stage], key=bary_fwd)
+            pos = positions_from_order()
+
+        for depth in range(len(stage_order) - 2, -1, -1):
+            stage = stage_order[depth]
+
+            def bary_bwd(n):
+                xs = [pos[s][0] for s in G.successors(n) if s in pos]
+                return np.mean(xs) if xs else pos[n][0]
+
+            order[stage] = sorted(order[stage], key=bary_bwd)
+            pos = positions_from_order()
 
     return pos
 
 
-def plot_lineage_graph(G, pos, node_color, out_path='pictures/wot_lineage_graph.png'):
+def sankey_ribbon(x1, y1, x2, y2, width, n=60):
+    """Filled polygon for one edge: a smooth S-curve (x eases from x1 to
+    x2 with a smoothstep while y descends linearly) that bulges to `width`
+    at its midpoint and tapers to a point at both endpoints."""
+    t = np.linspace(0, 1, n)
+    ease = 3 * t ** 2 - 2 * t ** 3
+    x = x1 + (x2 - x1) * ease
+    y = y1 + (y2 - y1) * t
+    w = width * np.sin(np.pi * t)
+
+    upper = np.stack([x + w / 2, y], axis=1)
+    lower = np.stack([x - w / 2, y], axis=1)
+    return np.vstack([upper, lower[::-1]])
+
+
+def plot_lineage_graph(G, pos, node_color, max_ribbon_width=0.7):
     pagerank = nx.pagerank(G, weight='weight')
     weights = np.array([d['weight'] for _, _, d in G.edges(data=True)])
-    ranks = pd.Series(weights).rank(pct=True).values  # ecdfQuantile-style scaling
+    ranks = pd.Series(weights).rank(pct=True).values
 
     fig, ax = plt.subplots(figsize=(12, 12))
 
     for (u, v, d), rank in zip(G.edges(data=True), ranks):
         x1, y1 = pos[u]
         x2, y2 = pos[v]
-        arrow = FancyArrowPatch(
-            (x1, y1), (x2, y2),
-            connectionstyle='arc3,rad=0.15',
-            arrowstyle='-|>', mutation_scale=12,
-            linewidth=rank * 8 + 0.3,
-            color=node_color.get(u, (0.6, 0.6, 0.6, 1.0)),
-            alpha=0.6, zorder=1,
-        )
-        ax.add_patch(arrow)
+        poly = sankey_ribbon(x1, y1, x2, y2, width=rank * max_ribbon_width + 0.02)
+        ax.fill(poly[:, 0], poly[:, 1], color=node_color.get(u, (0.6, 0.6, 0.6, 1.0)),
+                alpha=0.55, lw=0, zorder=1)
 
     for node, (x, y) in pos.items():
-        size = pagerank[node] * 4000 + 60
+        size = np.log1p(pagerank[node] * 1000) * 300 + 60
         ax.scatter(x, y, s=size, color='black', edgecolors='white',
                    linewidth=1.2, zorder=3)
-        ax.text(x, y + 0.12, G.nodes[node]['cluster'], fontsize=13,
+        ax.text(x, y + 0.15, G.nodes[node]['cluster'], fontsize=13,
                 fontweight='bold', ha='center', zorder=4)
 
     for stage in set(nx.get_node_attributes(G, 'stage').values()):
@@ -167,8 +192,6 @@ def plot_lineage_graph(G, pos, node_color, out_path='pictures/wot_lineage_graph.
     ax.set_axis_off()
     ax.margins(0.15)
     fig.tight_layout()
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    fig.savefig(out_path, dpi=150)
     return fig
 
 
